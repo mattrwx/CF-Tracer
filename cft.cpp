@@ -306,12 +306,11 @@ namespace cft
 
         std::array<std::uint8_t, sizeof(faulting_ins)> saved{};
         std::memcpy(saved.data(), address, sizeof(faulting_ins));
-        if (!orig_ins_map.contains(address))
-        {
-            orig_ins_map.insert({ address, saved }); //orig_ins_map.emplace(address, saved);
 
-            helper::safe_copy(address, faulting_ins);
-        }
+        if (!orig_ins_map.contains(address))
+            orig_ins_map.insert({ address, saved });
+
+        helper::safe_copy(address, faulting_ins);
     }
 
     // This is where the magic happens :p
@@ -473,6 +472,7 @@ namespace cft
             offset += ins.info.length;
         }
 
+        // Actually place out breakpoints 
         while (!bp_stack.empty())
         {
             void* bp = bp_stack.top();
