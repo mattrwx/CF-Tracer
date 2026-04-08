@@ -13,6 +13,7 @@
 #define ZYDIS_STATIC_BUILD
 #include "Zydis/Zydis.h"
 
+#include "dumper.hpp"
 
 namespace cft
 {
