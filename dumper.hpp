@@ -1,13 +1,5 @@
 #include <Windows.h>
-#include <iostream>
 #include <fstream>
-
-#define ZYDIS_STATIC_BUILD
-#include "Zydis/Zydis.h"
-
-
-
-
 
 namespace dumper
 {
