@@ -8,6 +8,7 @@
 #include <print>
 #include <unordered_map>
 #include <array>
+#include <stack>
 
 #define ZYDIS_STATIC_BUILD
 #include "Zydis/Zydis.h"
@@ -17,5 +18,5 @@ namespace cft
 {
 	void init(void);
 
-	void bp_function(const void* address, std::uint8_t recursion_limit = 1, std::uint8_t depth = 0);
+	void bp_function(const void* address);
 }
