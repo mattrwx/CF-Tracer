@@ -3,26 +3,34 @@
 #include "cft.hpp"
 
 #pragma optimize("", off)
-void c(int x)
+bool messaged{};
+void __declspec(noinline) c(int x)
 {
+    Beep(100, 100);
+    std::println("c()");
+
     if (x > 10)
         volatile int y = x * 2;
     else
         volatile int y = x + 1;
-    
-    std::println("I am in C");
 }
 
-void b(int x)
+void __declspec(noinline) b(int x)
 {
+    Beep(100, 100);
+    std::println("b()");
+
     if (x % 2 == 0)
         c(x);
     else
         c(x + 1);
 }
 
-void a()
+void __declspec(noinline) a()
 {
+    Beep(100, 100);
+    std::println("a()");
+
     for (int i = 0; i < 5; i++)
         b(i);
 }
@@ -42,9 +50,11 @@ bool APIENTRY DllMain(HMODULE h_module, std::uint32_t reason_for_call, std::uint
 
         cft::init();
 
-        cft::bp_function(&b, 5);
+        cft::bp_function(&a);
 
-        b(10);
+        a();
+
+        MessageBoxA(0, "Complete!", 0, 0);
     }
 
     return TRUE;
