@@ -16,7 +16,9 @@
 
 namespace cft
 {
-	void init(void);
+	void init(std::uint16_t max_recurse_depth);
 
 	void bp_function(const void* address);
+
+	void cleanup();
 }
