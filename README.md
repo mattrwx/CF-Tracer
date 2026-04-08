@@ -54,7 +54,7 @@ e:  48 c7 c2 02 00 00 00    mov    rdx,0x2
 
 Next, the vectored exception handler will allow for the logic to continue. Directly hitting a breakpoint in the next instruction. This next instruction will restore the breakpoint at line 15, and then restore its own original bytes.
 
-[Snippet 4] After restore exception (Same as [Snippet] 2):
+[Snippet 4] After restore exception (Same as [Snippet 2]):
 ```asm
 0:  48 83 ec 28             sub    rsp,0x28
 4:  48 89 cb                mov    rbx,rcx
