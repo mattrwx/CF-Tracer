@@ -1,6 +1,5 @@
 #include "cft.hpp"
 
-bool extra_prints = false;
 bool print_bp_function = false;
 
 namespace cft
@@ -11,15 +10,15 @@ namespace cft
 
     std::uint16_t max_recurse_depth{};
 
-	// mov cr3, rax <- privledged instruction: will always cause exception in usermode
-	// Why use this over int 3? Because anti-debugger routines will typically pick up on that
-    constexpr std::array<std::uint8_t, 3> faulting_ins = { 0x0F, 0x22, 0xD8 };
+    // mov <control register> <- privledged instruction: will always cause exception in usermode
+    // Why use this over int 3? Because anti-debugger routines will typically pick up on that
+    constexpr std::array<std::uint8_t, 2> faulting_ins = { 0x0F, 0x22 };
 
-	// Map containing address -> original bytes
-	std::unordered_map<void*, std::array<std::uint8_t, sizeof(faulting_ins)>> orig_ins_map;
+    // Map containing address -> original bytes
+    std::unordered_map<void*, std::array<std::uint8_t, sizeof(faulting_ins)>> orig_ins_map;
 
-	namespace helper
-	{
+    namespace helper
+    {
         // ZydisDisassembleIntel wrapper
         ZydisDisassembledInstruction get_ins(void* address)
         {
@@ -103,8 +102,6 @@ namespace cft
         // Will return call address, nullptr if unresolvable
         void* get_call_address(const ZydisDisassembledInstruction& instruction, const _CONTEXT* ctx = nullptr)
         {
-            if (extra_prints)std::println("get_call_address");
-
             const auto& op = instruction.operands[0];
             std::uintptr_t addr{};
 
@@ -113,10 +110,7 @@ namespace cft
                 ZydisCalcAbsoluteAddress(&instruction.info, &op, instruction.runtime_address, &addr);
 
                 if (op.type == ZYDIS_OPERAND_TYPE_MEMORY && op.mem.base == ZYDIS_REGISTER_RIP)
-                {
-                    if (extra_prints)std::println("ZYDIS_OPERAND_TYPE_MEMORY -> {:X} | {:X}", addr, *reinterpret_cast<uintptr_t*>(addr));
                     addr = *reinterpret_cast<uintptr_t*>(addr);
-                }
             }
 
             else if (op.type == ZYDIS_OPERAND_TYPE_REGISTER && ctx)
@@ -143,8 +137,7 @@ namespace cft
 
             else
                 return nullptr;
-
-            if (extra_prints)std::println("get_call_address -> {:X}", addr);
+            
             return reinterpret_cast<void*>(addr);
         }
 
@@ -235,7 +228,7 @@ namespace cft
 
             else if (void* jmp = get_jmp_address(instruction, exception_info))
                 result = jmp;
-            
+
             else
                 result = reinterpret_cast<void*>(next_linear);
 
@@ -250,13 +243,13 @@ namespace cft
 
             // We have to ensure that the page is writable, the chances of it being writable by default is close to zero since we are overwriting code.
             VirtualProtect(address, size, PAGE_EXECUTE_READWRITE, &old_protect);
-            
+
             std::memcpy(reinterpret_cast<void*>(address), bytes.data(), size);
 
             // We don't want to leave it RWX because that would probably fail any base level anti-tamper checks.
             VirtualProtect(address, size, old_protect, &old_protect);
         }
-	
+
         // Will return true if instruction is a control flow instruction
         // Any extra instructions that you want to BP should be put in this list
         bool is_control_flow(const ZydisDisassembledInstruction& instruction)
@@ -296,14 +289,11 @@ namespace cft
         {
             return instruction.info.mnemonic == ZYDIS_MNEMONIC_RET;
         }
-}
+    }
 
     // Not only add the bp code, but will also log it in the map.
     void place_bp(void* address)
     {
-        if (orig_ins_map.contains(address))
-            return;
-
         std::array<std::uint8_t, sizeof(faulting_ins)> saved{};
         std::memcpy(saved.data(), address, sizeof(faulting_ins));
 
@@ -317,7 +307,7 @@ namespace cft
     std::int32_t exception_handler(const _EXCEPTION_POINTERS* exception_info)
     {
         // Skipping unrelated exceptions.
-        // Another benefit to using mov cr3, rax is that a privledged instruction exception is very rare.
+        // Another benefit to using mov <control register> is that a privledged instruction exception is very rare.
         // If you make your exception something less unique, lets say a access violation, you will have
         // to rely on the fact that the faulting address is not in the orig_ins_map and will be skipped regardless.
         if (exception_info->ExceptionRecord->ExceptionCode != EXCEPTION_PRIV_INSTRUCTION)
@@ -331,7 +321,7 @@ namespace cft
 
         // If the iterator is at the end, it means we haven't found our faulting address in the orig_ins_map.
         // This either means some sort of bug has occured, or more likely that the exception was not ours.
-        // In the case of mov cr3, we can imagine this would be quite rare but still very important.
+        // In the case of mov <control register>, we can imagine this would be quite rare but still very important.
         if (it == orig_ins_map.end())
             return EXCEPTION_CONTINUE_SEARCH;
 
@@ -342,20 +332,18 @@ namespace cft
         // Breakpoint
         if (!prev_ins_addr)
         {
-            if (extra_prints)std::println("Breakpoint");
-
             // Cache current instruction address
             prev_ins_addr = curr_ins_addr;
 
             // Copy original code into current instruction
             helper::safe_copy(curr_ins_addr, it->second);
-            
+
             // Get ZydisDisassembledInstruction of current instruction (breakpoint)
             auto bp_ins = helper::get_ins(curr_ins_addr);
 
             // Keep track how low we are going
             static std::uint16_t recurse_depth{};
-            
+
             if (bp_ins.info.mnemonic == ZYDIS_MNEMONIC_CALL)
             {
                 auto call_address = helper::get_call_address(bp_ins);
@@ -378,13 +366,14 @@ namespace cft
                     std::println("{}", bp_ins.text);
 
                     //Recurse into next function (no need to recurse into named functions)
-                    if (recurse_depth < max_recurse_depth && !IsBadCodePtr(reinterpret_cast<FARPROC>(call_address)))
+                    if (recurse_depth < max_recurse_depth)
                     {
-                        if (extra_prints)std::println("Recursing");
+                        std::println("[recursing]");
                         cft::bp_function(call_address);
                         recurse_depth++;
                         place_bp(call_address);
                     }
+
                     // Not recursing into? place bp at next instruction
                     else
                         place_bp(reinterpret_cast<void*>(helper::get_next_address(bp_ins, exception_info)));
@@ -408,8 +397,6 @@ namespace cft
         // Restore
         else
         {
-            if (extra_prints)std::println("Restore");
-
             // Restore current instruction to original
             helper::safe_copy(curr_ins_addr, it->second);
 
@@ -433,6 +420,15 @@ namespace cft
         AddVectoredExceptionHandler(TRUE, reinterpret_cast<PVECTORED_EXCEPTION_HANDLER>(&exception_handler));
     }
 
+    // Remove all breakpoints
+    void cleanup()
+    {
+        for (auto it = orig_ins_map.begin(); it != orig_ins_map.end(); it++)
+            helper::safe_copy(it->first, it->second);
+
+        RemoveVectoredExceptionHandler(&exception_handler);
+    }
+
     void bp_function(const void* address)
     {
         std::size_t offset{};
@@ -447,6 +443,13 @@ namespace cft
             if (ins.info.mnemonic == ZYDIS_MNEMONIC_INVALID)
                 break;
             
+            // See if this function is already being debugged
+            if (!std::strncmp(reinterpret_cast<const char*>(ins.runtime_address), reinterpret_cast<const char*>(faulting_ins.data()), faulting_ins.size()))
+            {
+                std::println("Function already breakpointed");
+                break;
+            }
+
             // Print instruction with markers
             if (print_bp_function)
             {
