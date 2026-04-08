@@ -212,27 +212,32 @@ namespace cft
         }
 
         // Will return address that control flow will be at next
+        void* get_next_address(const ZydisDisassembledInstruction& instruction, const _EXCEPTION_POINTERS* exception_info, bool& jmp_taken)
+        {
+            jmp_taken = true;
+
+            // ret
+            if (instruction.info.mnemonic == ZYDIS_MNEMONIC_RET)
+                return *reinterpret_cast<void**>(exception_info->ContextRecord->Rsp);
+
+            // call
+            if (instruction.info.mnemonic == ZYDIS_MNEMONIC_CALL)
+                return get_call_address(instruction, exception_info->ContextRecord);
+
+            // jmp taken
+            if (void* jmp = get_jmp_address(instruction, exception_info))
+                return jmp;
+
+            // jmp not taken
+            jmp_taken = false;
+            return reinterpret_cast<void*>(instruction.runtime_address + instruction.info.length);
+        }
+
+        // wrapper incase we dont care if the jmp was taken
         void* get_next_address(const ZydisDisassembledInstruction& instruction, const _EXCEPTION_POINTERS* exception_info)
         {
-            void* result = nullptr;
-
-            const auto mnemonic = instruction.info.mnemonic;
-            const std::uintptr_t next_linear = instruction.runtime_address + instruction.info.length;
-            const auto ctx = exception_info->ContextRecord;
-
-            if (mnemonic == ZYDIS_MNEMONIC_RET)
-                result = *reinterpret_cast<void**>(ctx->Rsp);
-
-            else if (mnemonic == ZYDIS_MNEMONIC_CALL)
-                return get_call_address(instruction, ctx);
-
-            else if (void* jmp = get_jmp_address(instruction, exception_info))
-                result = jmp;
-
-            else
-                result = reinterpret_cast<void*>(next_linear);
-
-            return result;
+            bool jmp_taken{};
+            return get_next_address(instruction, exception_info, jmp_taken);
         }
 
         // std::memcpy wrapper that ensures writing permissions
@@ -344,6 +349,8 @@ namespace cft
             // Keep track how low we are going
             static std::uint16_t recurse_depth{};
 
+            std::string out_string;
+
             if (bp_ins.info.mnemonic == ZYDIS_MNEMONIC_CALL)
             {
                 auto call_address = helper::get_call_address(bp_ins);
@@ -353,22 +360,22 @@ namespace cft
                 if (function_name.has_value())
                 {
                     // Print with real function name
-                    std::println("call {}", function_name.value());
+                    out_string = std::format("call {}", function_name.value());
+
+                    place_bp(helper::get_call_address(bp_ins, exception_info->ContextRecord));
 
                     // Note: Purposefully not recursing into it if it's an imported function
-                    place_bp(reinterpret_cast<void*>(helper::get_next_address(bp_ins, exception_info)));
                 }
 
 
                 else
                 {
                     // Normal print instruction
-                    std::println("{}", bp_ins.text);
+                    out_string = std::format("{}", bp_ins.text);
 
                     //Recurse into next function (no need to recurse into named functions)
                     if (recurse_depth < max_recurse_depth)
                     {
-                        std::println("[recursing]");
                         cft::bp_function(call_address);
                         recurse_depth++;
                         place_bp(call_address);
@@ -382,16 +389,20 @@ namespace cft
             else
             {
                 // Normal print instruction
-                std::println("{}", bp_ins.text);
 
                 // Breakpoint next instruction
                 place_bp(helper::get_next_address(bp_ins, exception_info));
+                out_string = std::format("{}", bp_ins.text);
 
-                // Update depth
+                // Update depth for ret
                 if (bp_ins.info.mnemonic == ZYDIS_MNEMONIC_RET)
                     recurse_depth--;
             }
 
+            std::println("{}", out_string);
+
+            bool jmp_taken{ true };
+            dumper::dump(out_string, helper::get_next_address(bp_ins, exception_info, jmp_taken), jmp_taken, exception_info);
         }
 
         // Restore
@@ -445,10 +456,7 @@ namespace cft
             
             // See if this function is already being debugged
             if (!std::strncmp(reinterpret_cast<const char*>(ins.runtime_address), reinterpret_cast<const char*>(faulting_ins.data()), faulting_ins.size()))
-            {
-                std::println("Function already breakpointed");
                 break;
-            }
 
             // Print instruction with markers
             if (print_bp_function)
