@@ -1,10 +1,12 @@
-#include <cft.hpp>
+#include "cft.hpp"
 
 namespace cft
 {
     // Zydis globals for disassembly
     ZydisDecoder decoder;
     ZydisFormatter formatter;
+
+    std::uint16_t max_recurse_depth = 3;
 
 	// mov cr3, rax <- privledged instruction: will always cause exception in usermode
 	// Why use this over int 3? Because anti-debugger routines will typically pick up on that
@@ -15,8 +17,88 @@ namespace cft
 
 	namespace helper
 	{
-        // Will return call address for ZYDIS_OPERAND_TYPE_IMMEDIATE and ZYDIS_OPERAND_TYPE_MEMORY
-        void* get_call_address(const ZydisDisassembledInstruction& instruction)
+        // ZydisDisassembleIntel wrapper
+        ZydisDisassembledInstruction get_ins(void* address)
+        {
+            ZydisDisassembledInstruction ins{};
+            if (ZYAN_SUCCESS(ZydisDisassembleIntel(
+                ZYDIS_MACHINE_MODE_LONG_64,
+                reinterpret_cast<std::uintptr_t>(address),
+                address,
+                ZYDIS_MAX_OPERAND_COUNT,
+                &ins)))
+                return ins;
+
+            return {};
+        }
+
+        // Searches for function name in every module's exports.
+        std::optional<std::string> identify_function(void* function_address)
+        {
+            // This map will act as a export name cache. We don't want to walk every single module's exports
+            // every time we want to identify a function
+            static std::unordered_map<void*, std::string> name_map;
+
+            // Query cache
+            auto it = name_map.find(function_address);
+
+            // Handle cache hit
+            if (it != name_map.end())
+                return it->second;
+
+            // Handle cache miss
+
+            // This will be filled in as the function name if it is found
+            std::string name{};
+
+            // Not going to comment this whole function, but we are manually fetching the module list from the
+            // PEB and walking their export tables. Filling the cache on the way in case a new module has appeared etc
+            PROCESS_BASIC_INFORMATION basic_information;
+            NtQueryInformationProcess(GetCurrentProcess(), PROCESSINFOCLASS::ProcessBasicInformation, &basic_information, sizeof(PROCESS_BASIC_INFORMATION), 0);
+
+            LIST_ENTRY* module_list_start = &basic_information.PebBaseAddress->Ldr->InMemoryOrderModuleList;
+
+            for (LIST_ENTRY* current_entry = module_list_start->Flink; current_entry != module_list_start; current_entry = current_entry->Flink)
+            {
+                auto current_module = reinterpret_cast<std::uintptr_t>(CONTAINING_RECORD(current_entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks)->DllBase);
+
+                const auto dos_header = reinterpret_cast<IMAGE_DOS_HEADER*>(current_module);
+                const auto nt_headers = reinterpret_cast<IMAGE_NT_HEADERS64*>(current_module + dos_header->e_lfanew);
+
+                const auto export_directory = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+                if (!export_directory.VirtualAddress || !export_directory.Size)
+                    continue;
+
+                const auto export_table = *reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(current_module + export_directory.VirtualAddress);
+                if (!export_table.NumberOfNames || !export_table.AddressOfNames)
+                    continue;
+
+                auto functions = reinterpret_cast<DWORD*>(current_module + export_table.AddressOfFunctions);
+                auto ordinals = reinterpret_cast<WORD*> (current_module + export_table.AddressOfNameOrdinals);
+                auto names = reinterpret_cast<DWORD*>(current_module + export_table.AddressOfNames);
+
+                for (std::uint16_t i{}; i < export_table.NumberOfNames; i++)
+                {
+                    auto test_address = reinterpret_cast<void*>(current_module + functions[ordinals[i]]);
+                    auto test_name = std::string(reinterpret_cast<char*>(current_module + names[i]));
+
+                    name_map[test_address] = test_name;
+
+                    if (name.empty() && test_address == function_address)
+                        name = test_name;
+                }
+            }
+
+            // If we don't find the function, return std::nullopt
+            if (name.empty())
+                return std::nullopt;
+
+            // In the case that we find it :p
+            return name;
+        }
+
+        // Will return call address, nullptr if unresolvable
+        void* get_call_address(const ZydisDisassembledInstruction& instruction, const _CONTEXT* ctx = nullptr)
         {
             const auto& op = instruction.operands[0];
             std::uintptr_t addr{};
@@ -24,22 +106,45 @@ namespace cft
             if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE || op.type == ZYDIS_OPERAND_TYPE_MEMORY)
                 ZydisCalcAbsoluteAddress(&instruction.info, &op, instruction.runtime_address, &addr);
 
-            return reinterpret_cast<void*>(addr);
+            if (op.type == ZYDIS_OPERAND_TYPE_MEMORY)
+                addr = *reinterpret_cast<uintptr_t*>(addr);
+
+            else if (op.type == ZYDIS_OPERAND_TYPE_REGISTER && ctx)
+                switch (op.reg.value)
+                {
+                case ZYDIS_REGISTER_RAX: addr = ctx->Rax; break;
+                case ZYDIS_REGISTER_RCX: addr = ctx->Rcx; break;
+                case ZYDIS_REGISTER_RDX: addr = ctx->Rdx; break;
+                case ZYDIS_REGISTER_RBX: addr = ctx->Rbx; break;
+                case ZYDIS_REGISTER_RSP: addr = ctx->Rsp; break;
+                case ZYDIS_REGISTER_RBP: addr = ctx->Rbp; break;
+                case ZYDIS_REGISTER_RSI: addr = ctx->Rsi; break;
+                case ZYDIS_REGISTER_RDI: addr = ctx->Rdi; break;
+                case ZYDIS_REGISTER_R8:  addr = ctx->R8;  break;
+                case ZYDIS_REGISTER_R9:  addr = ctx->R9;  break;
+                case ZYDIS_REGISTER_R10: addr = ctx->R10; break;
+                case ZYDIS_REGISTER_R11: addr = ctx->R11; break;
+                case ZYDIS_REGISTER_R12: addr = ctx->R12; break;
+                case ZYDIS_REGISTER_R13: addr = ctx->R13; break;
+                case ZYDIS_REGISTER_R14: addr = ctx->R14; break;
+                case ZYDIS_REGISTER_R15: addr = ctx->R15; break;
+                default: return nullptr;
+                }
+
+            else
+                return nullptr;
+
+            auto result = reinterpret_cast<void*>(addr);
+
+            return result;
         }
 
-        // Will return address that control flow will be at next
-        void* get_next_address(const ZydisDisassembledInstruction& instruction, const _EXCEPTION_POINTERS* exception_info)
+        // Returns the target address of any jmp if taken, otherwise nullptr
+        void* get_jmp_address(const ZydisDisassembledInstruction& instruction, const _EXCEPTION_POINTERS* exception_info)
         {
             const auto mnemonic = instruction.info.mnemonic;
-            const std::uintptr_t next_linear = instruction.runtime_address + instruction.info.length;
             const auto flags = exception_info->ContextRecord->EFlags;
             const auto ctx = exception_info->ContextRecord;
-
-            if (mnemonic == ZYDIS_MNEMONIC_RET)
-                return *reinterpret_cast<void**>(ctx->Rsp);
-
-            if (mnemonic == ZYDIS_MNEMONIC_CALL)
-                return reinterpret_cast<void*>(next_linear);
 
             bool taken = false;
             switch (mnemonic)
@@ -67,17 +172,18 @@ namespace cft
             case ZYDIS_MNEMONIC_JCXZ:   taken = (ctx->Rcx & 0xFFFF) == 0; break;
             case ZYDIS_MNEMONIC_JECXZ:  taken = (ctx->Rcx & 0xFFFFFFFF) == 0; break;
             case ZYDIS_MNEMONIC_JRCXZ:  taken = ctx->Rcx == 0; break;
-            default: return reinterpret_cast<void*>(next_linear);
+            default: return nullptr;
             }
 
             if (!taken)
-                return reinterpret_cast<void*>(next_linear);
+                return nullptr;
 
             const auto& op = instruction.operands[0];
             std::uintptr_t addr{};
 
             if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE || op.type == ZYDIS_OPERAND_TYPE_MEMORY)
                 ZydisCalcAbsoluteAddress(&instruction.info, &op, instruction.runtime_address, &addr);
+
             else if (op.type == ZYDIS_OPERAND_TYPE_REGISTER)
                 switch (op.reg.value)
                 {
@@ -97,11 +203,36 @@ namespace cft
                 case ZYDIS_REGISTER_R13: addr = ctx->R13; break;
                 case ZYDIS_REGISTER_R14: addr = ctx->R14; break;
                 case ZYDIS_REGISTER_R15: addr = ctx->R15; break;
+                default: return nullptr;
                 }
 
             return reinterpret_cast<void*>(addr);
         }
-        
+
+        // Will return address that control flow will be at next
+        void* get_next_address(const ZydisDisassembledInstruction& instruction, const _EXCEPTION_POINTERS* exception_info)
+        {
+            void* result = nullptr;
+
+            const auto mnemonic = instruction.info.mnemonic;
+            const std::uintptr_t next_linear = instruction.runtime_address + instruction.info.length;
+            const auto ctx = exception_info->ContextRecord;
+
+            if (mnemonic == ZYDIS_MNEMONIC_RET)
+                result = *reinterpret_cast<void**>(ctx->Rsp);
+
+            else if (mnemonic == ZYDIS_MNEMONIC_CALL)
+                return get_call_address(instruction, ctx);
+
+            else if (void* jmp = get_jmp_address(instruction, exception_info))
+                result = jmp;
+            
+            else
+                result = reinterpret_cast<void*>(next_linear);
+
+            return result;
+        }
+
         // std::memcpy wrapper that ensures writing permissions
         template <std::size_t size>
         void safe_copy(void* address, const std::array<std::uint8_t, size>& bytes)
@@ -117,21 +248,6 @@ namespace cft
             VirtualProtect(address, size, old_protect, &old_protect);
         }
 	
-        // ZydisDisassembleIntel wrapper
-        ZydisDisassembledInstruction get_ins(void* address)
-        {
-            ZydisDisassembledInstruction ins{};
-            if (ZYAN_SUCCESS(ZydisDisassembleIntel(
-                ZYDIS_MACHINE_MODE_LONG_64,
-                reinterpret_cast<std::uintptr_t>(address),
-                address,
-                ZYDIS_MAX_OPERAND_COUNT,
-                &ins)))
-                return ins;
-
-            return {};
-        }
-    
         // Will return true if instruction is a control flow instruction
         // Any extra instructions that you want to BP should be put in this list
         bool is_control_flow(const ZydisDisassembledInstruction& instruction)
@@ -171,7 +287,6 @@ namespace cft
         {
             return instruction.info.mnemonic == ZYDIS_MNEMONIC_RET;
         }
-
 }
 
     // Not only add the bp code, but will also log it in the map.
@@ -221,13 +336,50 @@ namespace cft
 
             // Copy original code into current instruction
             helper::safe_copy(curr_ins_addr, it->second);
-
+            
             // Get ZydisDisassembledInstruction of current instruction (breakpoint)
             auto bp_ins = helper::get_ins(curr_ins_addr);
-            std::println("BP Hit: {}", bp_ins.text);
 
-            // Breakpoint next instruction
-            place_bp(helper::get_next_address(bp_ins, exception_info));
+            // Keep track how low we are going
+            static std::uint16_t recurse_depth{};
+            
+            if (bp_ins.info.mnemonic == ZYDIS_MNEMONIC_CALL)
+            {
+                auto call_address = helper::get_call_address(bp_ins);
+
+                auto function_name = helper::identify_function(call_address);
+
+                if (function_name.has_value())
+                    // Print with real function name
+                    std::println("call {}", function_name.value());
+
+                else
+                {
+                    // Normal print instruction
+                    std::println("{}", bp_ins.text);
+
+                    //Recurse into next function (no need to recurse into named functions)
+                    if (recurse_depth < max_recurse_depth)
+                    {
+                        cft::bp_function(call_address);
+                        recurse_depth++;
+                    }
+                }
+
+            }
+            else
+            {
+                // Normal print instruction
+                std::println("{}", bp_ins.text);
+
+                // Breakpoint next instruction
+                place_bp(helper::get_next_address(bp_ins, exception_info));
+
+                // Update depth
+                if (bp_ins.info.mnemonic == ZYDIS_MNEMONIC_RET)
+                    recurse_depth--;
+            }
+
         }
 
         // Restore
@@ -255,13 +407,11 @@ namespace cft
         AddVectoredExceptionHandler(TRUE, reinterpret_cast<PVECTORED_EXCEPTION_HANDLER>(&exception_handler));
     }
 
-    void bp_function(const void* address, std::uint8_t recursion_limit, std::uint8_t depth)
+    void bp_function(const void* address)
     {
-        // Check recursion depth
-        if (depth >= recursion_limit)
-            return;
-
         std::size_t offset{};
+
+        std::stack<void*> bp_stack;
 
         while(true)
         {
@@ -273,25 +423,23 @@ namespace cft
 
             // We are only interested in breakpoint control flow related instructions
             if (helper::is_control_flow(ins))
-                place_bp(reinterpret_cast<void*>(ins.runtime_address));
-
-            // Check if we've reached the end of the function
-            if (helper::is_function_end(ins))
-                break;
-
-            // If the call address can be determined, we can recurse into it
-            // This can also be done in the vectored exception handler to handle all call instructions
-            if (ins.info.mnemonic == ZYDIS_MNEMONIC_CALL)
             {
-                auto call_address = helper::get_call_address(ins);
+                bp_stack.push(reinterpret_cast<void*>(ins.runtime_address));
 
-                // If the call address isn't resolved it will be 0
-                if (call_address)
-                    bp_function(call_address, recursion_limit, depth + 1);
+                // Check if we've reached the end of the function
+                if (helper::is_function_end(ins))
+                    break;
             }
 
             // update the offset
             offset += ins.info.length;
+        }
+
+        while (!bp_stack.empty())
+        {
+            void* bp = bp_stack.top();
+            bp_stack.pop();
+            place_bp(bp);
         }
     }
 }
