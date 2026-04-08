@@ -1,12 +1,15 @@
 #include "cft.hpp"
 
+bool extra_prints = false;
+bool print_bp_function = false;
+
 namespace cft
 {
     // Zydis globals for disassembly
     ZydisDecoder decoder;
     ZydisFormatter formatter;
 
-    std::uint16_t max_recurse_depth = 3;
+    std::uint16_t max_recurse_depth{};
 
 	// mov cr3, rax <- privledged instruction: will always cause exception in usermode
 	// Why use this over int 3? Because anti-debugger routines will typically pick up on that
@@ -100,14 +103,21 @@ namespace cft
         // Will return call address, nullptr if unresolvable
         void* get_call_address(const ZydisDisassembledInstruction& instruction, const _CONTEXT* ctx = nullptr)
         {
+            if (extra_prints)std::println("get_call_address");
+
             const auto& op = instruction.operands[0];
             std::uintptr_t addr{};
 
             if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE || op.type == ZYDIS_OPERAND_TYPE_MEMORY)
+            {
                 ZydisCalcAbsoluteAddress(&instruction.info, &op, instruction.runtime_address, &addr);
 
-            if (op.type == ZYDIS_OPERAND_TYPE_MEMORY)
-                addr = *reinterpret_cast<uintptr_t*>(addr);
+                if (op.type == ZYDIS_OPERAND_TYPE_MEMORY && op.mem.base == ZYDIS_REGISTER_RIP)
+                {
+                    if (extra_prints)std::println("ZYDIS_OPERAND_TYPE_MEMORY -> {:X} | {:X}", addr, *reinterpret_cast<uintptr_t*>(addr));
+                    addr = *reinterpret_cast<uintptr_t*>(addr);
+                }
+            }
 
             else if (op.type == ZYDIS_OPERAND_TYPE_REGISTER && ctx)
                 switch (op.reg.value)
@@ -134,9 +144,8 @@ namespace cft
             else
                 return nullptr;
 
-            auto result = reinterpret_cast<void*>(addr);
-
-            return result;
+            if (extra_prints)std::println("get_call_address -> {:X}", addr);
+            return reinterpret_cast<void*>(addr);
         }
 
         // Returns the target address of any jmp if taken, otherwise nullptr
@@ -296,10 +305,13 @@ namespace cft
             return;
 
         std::array<std::uint8_t, sizeof(faulting_ins)> saved{};
-        std::memcpy(saved.data(), reinterpret_cast<const void*>(address), sizeof(faulting_ins));
-        orig_ins_map.emplace(address, saved);
+        std::memcpy(saved.data(), address, sizeof(faulting_ins));
+        if (!orig_ins_map.contains(address))
+        {
+            orig_ins_map.insert({ address, saved }); //orig_ins_map.emplace(address, saved);
 
-        helper::safe_copy(address, faulting_ins);
+            helper::safe_copy(address, faulting_ins);
+        }
     }
 
     // This is where the magic happens :p
@@ -331,6 +343,8 @@ namespace cft
         // Breakpoint
         if (!prev_ins_addr)
         {
+            if (extra_prints)std::println("Breakpoint");
+
             // Cache current instruction address
             prev_ins_addr = curr_ins_addr;
 
@@ -350,8 +364,14 @@ namespace cft
                 auto function_name = helper::identify_function(call_address);
 
                 if (function_name.has_value())
+                {
                     // Print with real function name
                     std::println("call {}", function_name.value());
+
+                    // Note: Purposefully not recursing into it if it's an imported function
+                    place_bp(reinterpret_cast<void*>(helper::get_next_address(bp_ins, exception_info)));
+                }
+
 
                 else
                 {
@@ -359,13 +379,17 @@ namespace cft
                     std::println("{}", bp_ins.text);
 
                     //Recurse into next function (no need to recurse into named functions)
-                    if (recurse_depth < max_recurse_depth)
+                    if (recurse_depth < max_recurse_depth && !IsBadCodePtr(reinterpret_cast<FARPROC>(call_address)))
                     {
+                        if (extra_prints)std::println("Recursing");
                         cft::bp_function(call_address);
                         recurse_depth++;
+                        place_bp(call_address);
                     }
+                    // Not recursing into? place bp at next instruction
+                    else
+                        place_bp(reinterpret_cast<void*>(helper::get_next_address(bp_ins, exception_info)));
                 }
-
             }
             else
             {
@@ -385,11 +409,13 @@ namespace cft
         // Restore
         else
         {
-            // Place original breakpoint
-            place_bp(prev_ins_addr);
+            if (extra_prints)std::println("Restore");
 
             // Restore current instruction to original
             helper::safe_copy(curr_ins_addr, it->second);
+
+            // Place original breakpoint
+            place_bp(prev_ins_addr);
 
             // Make sure that the next exception caught is recognized as a breakpoint not a restore
             prev_ins_addr = nullptr;
@@ -398,8 +424,9 @@ namespace cft
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    void init(void)
+    void init(std::uint16_t max_recurse_depth)
     {
+        cft::max_recurse_depth = max_recurse_depth;
 
         ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
         ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
@@ -413,13 +440,24 @@ namespace cft
 
         std::stack<void*> bp_stack;
 
-        while(true)
+        while (true)
         {
             auto ins = helper::get_ins(reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(address) + offset));
-            
+
             // Make sure we have a valid instruction
             if (ins.info.mnemonic == ZYDIS_MNEMONIC_INVALID)
                 break;
+            
+            // Print instruction with markers
+            if (print_bp_function)
+            {
+                std::string line = ins.text;
+                if (helper::is_control_flow(ins))
+                    line += " <- CONTROL FLOW";
+                if (helper::is_function_end(ins))
+                    line += " <- END";
+                std::println("------->{}", line);
+            }
 
             // We are only interested in breakpoint control flow related instructions
             if (helper::is_control_flow(ins))
