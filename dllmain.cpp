@@ -7,7 +7,6 @@ bool messaged{};
 void __declspec(noinline) c(int x)
 {
     Beep(100, 100);
-    std::println("c()");
 
     if (x > 10)
         volatile int y = x * 2;
@@ -18,7 +17,6 @@ void __declspec(noinline) c(int x)
 void __declspec(noinline) b(int x)
 {
     Beep(100, 100);
-    std::println("b()");
 
     if (x % 2 == 0)
         c(x);
@@ -29,7 +27,6 @@ void __declspec(noinline) b(int x)
 void __declspec(noinline) a()
 {
     Beep(100, 100);
-    std::println("a()");
 
     for (int i = 0; i < 5; i++)
         b(i);
@@ -48,7 +45,7 @@ bool APIENTRY DllMain(HMODULE h_module, std::uint32_t reason_for_call, std::uint
         freopen_s(&f, "CONOUT$", "w", stdout);
 
 
-        cft::init();
+        cft::init(5);
 
         cft::bp_function(&a);
 
