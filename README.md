@@ -1,5 +1,5 @@
 <NOTICE>
-This is an early release of CT-Tracer. I do plan on doing heavy modifications to what you see right now.
+The CT-Tracer is in a stable and working version. However, obviously the graph generator is missing. Expect to see the graph generator soon.
   
 # CF-Tracer
 A control flow analysis tool designed to map the control flow path taken by a program.
@@ -67,6 +67,4 @@ e:  48 c7 c2 02 00 00 00    mov    rdx,0x2
 ```
 
 
-
-
-// To be continued
+// To be continued...
