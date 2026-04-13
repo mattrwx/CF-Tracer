@@ -8,8 +8,6 @@ namespace cft
     ZydisDecoder decoder;
     ZydisFormatter formatter;
 
-    std::uint16_t max_recurse_depth{};
-
     // mov <control register> <- privledged instruction: will always cause exception in usermode
     // Why use this over int 3? Because anti-debugger routines will typically pick up on that
     constexpr std::array<std::uint8_t, 2> faulting_ins = { 0x0F, 0x22 };
@@ -212,32 +210,36 @@ namespace cft
         }
 
         // Will return address that control flow will be at next
-        void* get_next_address(const ZydisDisassembledInstruction& instruction, const _EXCEPTION_POINTERS* exception_info, bool& jmp_taken)
+        void* get_next_address(const ZydisDisassembledInstruction& instruction, const _EXCEPTION_POINTERS* exception_info, std::string out_string)
         {
-            jmp_taken = true;
-
             // ret
             if (instruction.info.mnemonic == ZYDIS_MNEMONIC_RET)
                 return *reinterpret_cast<void**>(exception_info->ContextRecord->Rsp);
 
             // call
             if (instruction.info.mnemonic == ZYDIS_MNEMONIC_CALL)
-                return get_call_address(instruction, exception_info->ContextRecord);
+            {
+                auto call_addr = get_call_address(instruction, exception_info->ContextRecord);
+
+                // If its a call instruction, we want to check if there is a name we can put instead of the address
+                auto function_name = helper::identify_function(call_addr);
+
+                if (function_name.has_value())
+                {
+                    out_string = std::format("call {}", function_name.value());
+
+                    return reinterpret_cast<void*>(instruction.runtime_address + instruction.info.length);
+                }
+
+                return call_addr;
+            }
 
             // jmp taken
             if (void* jmp = get_jmp_address(instruction, exception_info))
                 return jmp;
 
             // jmp not taken
-            jmp_taken = false;
             return reinterpret_cast<void*>(instruction.runtime_address + instruction.info.length);
-        }
-
-        // wrapper incase we dont care if the jmp was taken
-        void* get_next_address(const ZydisDisassembledInstruction& instruction, const _EXCEPTION_POINTERS* exception_info)
-        {
-            bool jmp_taken{};
-            return get_next_address(instruction, exception_info, jmp_taken);
         }
 
         // std::memcpy wrapper that ensures writing permissions
@@ -294,7 +296,21 @@ namespace cft
         {
             return instruction.info.mnemonic == ZYDIS_MNEMONIC_RET;
         }
-    }
+    
+        // Fetch control flow changing instruction
+        void* fetch_next_target(void* addr)
+        {
+            auto current_ins = get_ins(addr);
+
+            while (true)
+            {
+                current_ins = get_ins(reinterpret_cast<void*>(current_ins.runtime_address + current_ins.info.length));
+
+                if (is_control_flow(current_ins))
+                    return reinterpret_cast<void*>(current_ins.runtime_address);
+            }
+        }
+}
 
     // Not only add the bp code, but will also log it in the map.
     void place_bp(void* address)
@@ -330,105 +346,41 @@ namespace cft
         if (it == orig_ins_map.end())
             return EXCEPTION_CONTINUE_SEARCH;
 
-        // This static variable is needed to help restore the breakpoint after being lifted.
-        // If it's nullptr then we are on the breakpoint, else we are restoring a lifted breakpoint.
-        static void* prev_ins_addr = nullptr;
+        // Copy original code into current instruction
+        helper::safe_copy(curr_ins_addr, it->second);
 
-        // Breakpoint
-        if (!prev_ins_addr)
-        {
-            // Cache current instruction address
-            prev_ins_addr = curr_ins_addr;
+        // Get ZydisDisassembledInstruction of current instruction (breakpoint)
+        auto bp_ins = helper::get_ins(curr_ins_addr);
 
-            // Copy original code into current instruction
-            helper::safe_copy(curr_ins_addr, it->second);
+        // instruction string for dump
+        std::string out_string = bp_ins.text;
 
-            // Get ZydisDisassembledInstruction of current instruction (breakpoint)
-            auto bp_ins = helper::get_ins(curr_ins_addr);
+        // next instruction after bp
+        auto next_address = helper::get_next_address(bp_ins, exception_info, out_string);
 
-            // Keep track how low we are going
-            static std::uint16_t recurse_depth{};
+        // next cf instruction 
+        auto next_target = helper::fetch_next_target(next_address);
 
-            std::string out_string;
+        // place bp at target
+        place_bp(next_target);
 
-            if (bp_ins.info.mnemonic == ZYDIS_MNEMONIC_CALL)
-            {
-                auto call_address = helper::get_call_address(bp_ins);
+        if (out_string.empty())
+            out_string = bp_ins.text;
 
-                auto function_name = helper::identify_function(call_address);
-
-                if (function_name.has_value())
-                {
-                    // Print with real function name
-                    out_string = std::format("call {}", function_name.value());
-
-                    place_bp(helper::get_call_address(bp_ins, exception_info->ContextRecord));
-
-                    // Note: Purposefully not recursing into it if it's an imported function
-                }
-
-
-                else
-                {
-                    // Normal print instruction
-                    out_string = std::format("{}", bp_ins.text);
-
-                    //Recurse into next function (no need to recurse into named functions)
-                    if (recurse_depth < max_recurse_depth)
-                    {
-                        cft::bp_function(call_address);
-                        recurse_depth++;
-                        place_bp(call_address);
-                    }
-
-                    // Not recursing into? place bp at next instruction
-                    else
-                        place_bp(reinterpret_cast<void*>(helper::get_next_address(bp_ins, exception_info)));
-                }
-            }
-            else
-            {
-                // Normal print instruction
-
-                // Breakpoint next instruction
-                place_bp(helper::get_next_address(bp_ins, exception_info));
-                out_string = std::format("{}", bp_ins.text);
-
-                // Update depth for ret
-                if (bp_ins.info.mnemonic == ZYDIS_MNEMONIC_RET)
-                    recurse_depth--;
-            }
-
-            std::println("{}", out_string);
-
-            bool jmp_taken{ true };
-            dumper::dump(out_string, helper::get_next_address(bp_ins, exception_info, jmp_taken), jmp_taken, exception_info);
-        }
-
-        // Restore
-        else
-        {
-            // Restore current instruction to original
-            helper::safe_copy(curr_ins_addr, it->second);
-
-            // Place original breakpoint
-            place_bp(prev_ins_addr);
-
-            // Make sure that the next exception caught is recognized as a breakpoint not a restore
-            prev_ins_addr = nullptr;
-        }
+        std::println("{}", out_string);
+        dumper::dump(out_string, exception_info);
 
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    void init(std::uint16_t max_recurse_depth)
+    void init(void* start)
     {
-        cft::max_recurse_depth = max_recurse_depth;
-
         ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
         ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
 
         AddVectoredExceptionHandler(TRUE, reinterpret_cast<PVECTORED_EXCEPTION_HANDLER>(&exception_handler));
+
+        place_bp(start);
     }
 
     // Remove all breakpoints
@@ -438,57 +390,5 @@ namespace cft
             helper::safe_copy(it->first, it->second);
 
         RemoveVectoredExceptionHandler(&exception_handler);
-    }
-
-    void bp_function(const void* address)
-    {
-        std::size_t offset{};
-
-        std::stack<void*> bp_stack;
-
-        while (true)
-        {
-            auto ins = helper::get_ins(reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(address) + offset));
-
-            // Make sure we have a valid instruction
-            if (ins.info.mnemonic == ZYDIS_MNEMONIC_INVALID)
-                break;
-            
-            // See if this function is already being debugged
-            if (!std::strncmp(reinterpret_cast<const char*>(ins.runtime_address), reinterpret_cast<const char*>(faulting_ins.data()), faulting_ins.size()))
-                break;
-
-            // Print instruction with markers
-            if (print_bp_function)
-            {
-                std::string line = ins.text;
-                if (helper::is_control_flow(ins))
-                    line += " <- CONTROL FLOW";
-                if (helper::is_function_end(ins))
-                    line += " <- END";
-                std::println("------->{}", line);
-            }
-
-            // We are only interested in breakpoint control flow related instructions
-            if (helper::is_control_flow(ins))
-            {
-                bp_stack.push(reinterpret_cast<void*>(ins.runtime_address));
-
-                // Check if we've reached the end of the function
-                if (helper::is_function_end(ins))
-                    break;
-            }
-
-            // update the offset
-            offset += ins.info.length;
-        }
-
-        // Actually place out breakpoints 
-        while (!bp_stack.empty())
-        {
-            void* bp = bp_stack.top();
-            bp_stack.pop();
-            place_bp(bp);
-        }
     }
 }
