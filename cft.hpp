@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <array>
 #include <stack>
+#include <winternl.h>
 
 #define ZYDIS_STATIC_BUILD
 #include "Zydis/Zydis.h"
@@ -17,7 +18,13 @@
 
 namespace cft
 {
-	void init(void* start);
+	enum hook_type
+	{
+		veh,
+		wow64
+	};
+
+	void init(void* start, hook_type hooking_method);
 
 	void cleanup();
 }
