@@ -42,11 +42,10 @@ void benchmark(HMODULE h_module)
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
 
-    cft::init(&a);
+    cft::init(&a, cft::hook_type::wow64);
     a();
     cft::cleanup();
-    MessageBoxA(0, "Complete!", 0, 0);
-    std::println("complete");
+    std::println("< complete >");
 
     FreeConsole();
     FreeLibraryAndExitThread(h_module, 0);
