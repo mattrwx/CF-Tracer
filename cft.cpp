@@ -361,14 +361,14 @@ namespace cft
         // next cf instruction 
         auto next_target = helper::fetch_next_target(next_address);
 
-        // place bp at target
-        place_bp(next_target);
-
         if (out_string.empty())
             out_string = bp_ins.text;
 
         std::println("{}", out_string);
         dumper::dump(out_string, exception_info);
+
+        // place bp at target
+        place_bp(next_target);
 
         return EXCEPTION_CONTINUE_EXECUTION;
     }
