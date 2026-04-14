@@ -12,6 +12,8 @@ namespace cft
     // Why use this over int 3? Because anti-debugger routines will typically pick up on that
     constexpr std::array<std::uint8_t, 2> faulting_ins = { 0x0F, 0x22 };
 
+    void(*ZwContinue)(CONTEXT*, bool) = nullptr;
+
     // Map containing address -> original bytes
     std::unordered_map<void*, std::array<std::uint8_t, sizeof(faulting_ins)>> orig_ins_map;
 
@@ -257,6 +259,21 @@ namespace cft
             VirtualProtect(address, size, old_protect, &old_protect);
         }
 
+        // copy wrapper to overwrite protected regions
+        template <typename T>
+        void safe_copy(void* address, T data)
+        {
+            DWORD old_protect;
+
+            // We have to ensure that the page is writable, the chances of it being writable by default is close to zero since we are overwriting code.
+            VirtualProtect(address, sizeof(data), PAGE_EXECUTE_READWRITE, &old_protect);
+
+            *reinterpret_cast<T*>(address) = data;
+
+            // We don't want to leave it RWX because that would probably fail any base level anti-tamper checks.
+            VirtualProtect(address, sizeof(data), old_protect, &old_protect);
+        }
+
         // Will return true if instruction is a control flow instruction
         // Any extra instructions that you want to BP should be put in this list
         bool is_control_flow(const ZydisDisassembledInstruction& instruction)
@@ -325,7 +342,7 @@ namespace cft
     }
 
     // This is where the magic happens :p
-    std::int32_t exception_handler(const _EXCEPTION_POINTERS* exception_info)
+    std::int32_t bp_handler(EXCEPTION_POINTERS* exception_info)
     {
         // Skipping unrelated exceptions.
         // Another benefit to using mov <control register> is that a privledged instruction exception is very rare.
@@ -373,12 +390,49 @@ namespace cft
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    void init(void* start)
+    // Wrapper for exception handling with Wow64PrepareForException ptr swap
+    void wow64_exception_handler_hook(EXCEPTION_RECORD* exception_record, CONTEXT* context)
+    {
+        // VEH takes in a different struct as Wow64PrepareForException. Here is a simple way to make them compatible so I only need one "bp_handler" function.
+        EXCEPTION_POINTERS exception_info{ exception_record, context };
+
+        if (bp_handler(&exception_info) == EXCEPTION_CONTINUE_EXECUTION)
+
+            // Will resume execution in the case of EXCEPTION_CONTINUE_EXECUTION
+            ZwContinue(context, false);
+
+        // Normal exception handler for EXCEPTION_CONTINUE_SEARCH
+    }
+
+    // Use VEH to handle breakpoints
+    void init(void* start, hook_type hooking_method)
     {
         ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
         ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
 
-        AddVectoredExceptionHandler(TRUE, reinterpret_cast<PVECTORED_EXCEPTION_HANDLER>(&exception_handler));
+        switch (hooking_method)
+        {
+        case hook_type::veh:
+        {
+            AddVectoredExceptionHandler(true, reinterpret_cast<PVECTORED_EXCEPTION_HANDLER>(&bp_handler));
+            break;
+        }
+        case hook_type::wow64:
+        {
+            auto ntdll = GetModuleHandleA("ntdll.dll");
+            if (!ntdll)
+                return;
+
+            auto KiUserExceptionDispatcher_addr = reinterpret_cast<std::uintptr_t>(GetProcAddress(ntdll, "KiUserExceptionDispatcher"));
+            ZwContinue = reinterpret_cast<void(*)(CONTEXT*, bool)>(GetProcAddress(ntdll, "ZwContinue"));
+
+            // Getting Wow64PrepareForException ptr, and overwriting it with our hook function.
+            auto rel_addr = *reinterpret_cast<std::int32_t*>(KiUserExceptionDispatcher_addr + 4);
+            helper::safe_copy<void*>(reinterpret_cast<void*>(KiUserExceptionDispatcher_addr + 8 + rel_addr), &wow64_exception_handler_hook);
+
+            break;
+        }
+        }
 
         place_bp(start);
     }
@@ -389,6 +443,6 @@ namespace cft
         for (auto it = orig_ins_map.begin(); it != orig_ins_map.end(); it++)
             helper::safe_copy(it->first, it->second);
 
-        RemoveVectoredExceptionHandler(&exception_handler);
+        RemoveVectoredExceptionHandler(&bp_handler);
     }
 }
