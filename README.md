@@ -3,7 +3,6 @@ The CT-Tracer is in a stable and working version. However, obviously the graph g
   
 # CF-Tracer
 A control flow analysis tool designed to map the control flow path taken by a program.
-![banner](https://gcdnb.pbrd.co/images/pqHmHleK389C.png)
 
 ## Credits
 Major thanks to [Daax](https://github.com/daaximus) for helping me with this project.
