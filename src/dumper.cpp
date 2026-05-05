@@ -1,10 +1,9 @@
 #include "dumper.hpp"
 
 
-
 void dumper::dump(std::string instruction, const _EXCEPTION_POINTERS* exception_info)
 {
-	static std::ofstream file("dump.cfd", std::ios::out);
+    static std::ofstream file("dump.cfd", std::ios::out);
 
     file << instruction << "|";
 
