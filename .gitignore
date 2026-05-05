@@ -3,6 +3,4 @@ build/
 .vscode/
 .history/
 .cache/
-LICENSE
-README.md
 .clang-format
